@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 import os
 import io
@@ -6,508 +6,411 @@ import zipfile
 from datetime import datetime
 from rembg import remove
 from PIL import Image
-import base64
 import tempfile
 import shutil
+import json
+from werkzeug.utils import secure_filename
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import json
+import traceback
+from pyoxipng import optimize
 
 app = Flask(__name__)
-CORS(app)  # Permitir CORS para el frontend
+CORS(app)
+
+# Configuración
+UPLOAD_FOLDER = 'uploads'
+OUTPUT_FOLDER = 'output'
+ALLOWED_EXTENSIONS = {
+    'png', 'jpg', 'jpeg', 'gif', 'bmp', 'tiff', 'webp', 
+    'raw', 'psd', 'svg', 'eps', 'ai', 'heic', 'heif'
+}
+
+# Crear carpetas necesarias
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 class ImageProcessor:
     def __init__(self):
-        self.temp_dir = tempfile.mkdtemp()
-        self.supported_formats = {
-            'JPEG': ['.jpg', '.jpeg'],
-            'PNG': ['.png'],
-            'GIF': ['.gif'],
-            'WEBP': ['.webp'],
-            'BMP': ['.bmp'],
-            'TIFF': ['.tiff', '.tif'],
-            'RAW': ['.raw', '.cr2', '.nef', '.arw', '.dng'],
-            'SVG': ['.svg'],
-            'EPS': ['.eps'],
-            'AI': ['.ai'],
-            'HEIC': ['.heic'],
-            'HEIF': ['.heif'],
-            'PSD': ['.psd']
-        }
+        self.processing_status = {}
+        
+    def allowed_file(self, filename):
+        return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
     
-    def is_supported_format(self, filename):
-        """Verifica si el archivo tiene un formato soportado"""
-        ext = os.path.splitext(filename.lower())[1]
-        for format_type, extensions in self.supported_formats.items():
-            if ext in extensions:
-                return True
-        return False
-    
-    def process_single_image(self, image_data, filename, remove_bg=False, resize=False, width=400, height=400):
-        """Procesa una sola imagen según los parámetros especificados"""
+    def extract_images_from_zip(self, zip_path, extract_to):
+        """Extrae imágenes de un archivo ZIP"""
+        extracted_images = []
         try:
-            # Validar formato de archivo
-            if not self.is_supported_format(filename):
-                return {
-                    'success': False,
-                    'filename': filename,
-                    'error': f'Formato no soportado: {os.path.splitext(filename)[1]}'
-                }
-            
-            # Decodificar imagen base64
-            if isinstance(image_data, str) and image_data.startswith('data:image'):
-                image_data = image_data.split(',')[1]
-            
-            try:
-                image_bytes = base64.b64decode(image_data)
-                image = Image.open(io.BytesIO(image_bytes))
-            except Exception as e:
-                return {
-                    'success': False,
-                    'filename': filename,
-                    'error': f'Error al decodificar imagen: {str(e)}'
-                }
-            
-            # Obtener tamaño original para estadísticas
-            original_size = len(image_bytes)
-            
-            # Convertir a RGBA si es necesario para preservar transparencia
-            if image.mode not in ('RGBA', 'RGB'):
-                if image.mode in ('P', 'LA') or 'transparency' in image.info:
-                    image = image.convert('RGBA')
-                else:
-                    image = image.convert('RGB')
-            
-            # Procesar imagen según switches activados
-            processed_image = image
-            operations_applied = {
-                'background_removed': False,
-                'resized': False,
-                'dimensions': 'original',
-                'optimized': True
-            }
-            
-            # Paso 1: Remover fondo si se solicita
-            if remove_bg:
-                try:
-                    processed_image = self._remove_background_from_image(processed_image)
-                    operations_applied['background_removed'] = True
-                except Exception as e:
-                    return {
-                        'success': False,
-                        'filename': filename,
-                        'error': f'Error al remover fondo: {str(e)}'
-                    }
-            
-            # Paso 2: Redimensionar si se solicita  
-            if resize:
-                try:
-                    processed_image = self._resize_image(processed_image, int(width), int(height))
-                    operations_applied['resized'] = True
-                    operations_applied['dimensions'] = f"{width}x{height}"
-                except Exception as e:
-                    return {
-                        'success': False,
-                        'filename': filename,
-                        'error': f'Error al redimensionar: {str(e)}'
-                    }
-            
-            # Paso 3: Optimizar imagen (siempre aplicado)
-            try:
-                processed_image = self._optimize_image(processed_image)
-            except Exception as e:
-                return {
-                    'success': False,
-                    'filename': filename,
-                    'error': f'Error al optimizar: {str(e)}'
-                }
-            
-            # Convertir a PNG optimizado para salida
-            try:
-                buffer = io.BytesIO()
-                # Configuraciones de optimización PNG
-                processed_image.save(
-                    buffer, 
-                    format='PNG',
-                    optimize=True,
-                    compress_level=6  # Balance entre compresión y velocidad
-                )
-                buffer.seek(0)
-                
-                # Calcular estadísticas de compresión
-                final_size = len(buffer.getvalue())
-                compression_ratio = ((original_size - final_size) / original_size) * 100
-                
-                processed_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-                
-                return {
-                    'success': True,
-                    'filename': filename,
-                    'processed_image': f"data:image/png;base64,{processed_base64}",
-                    'operations': operations_applied,
-                    'stats': {
-                        'original_size': original_size,
-                        'final_size': final_size,
-                        'compression_ratio': round(compression_ratio, 1)
-                    }
-                }
-                
-            except Exception as e:
-                return {
-                    'success': False,
-                    'filename': filename,
-                    'error': f'Error al generar PNG: {str(e)}'
-                }
-                
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                for file_info in zip_ref.filelist:
+                    if not file_info.is_dir():
+                        filename = os.path.basename(file_info.filename)
+                        if self.allowed_file(filename):
+                            # Extraer archivo
+                            source = zip_ref.open(file_info)
+                            target_path = os.path.join(extract_to, secure_filename(filename))
+                            with open(target_path, 'wb') as target:
+                                shutil.copyfileobj(source, target)
+                            extracted_images.append(target_path)
+            return extracted_images
         except Exception as e:
+            print(f"Error extrayendo ZIP: {str(e)}")
+            return []
+    
+    def get_image_info(self, image_path):
+        """Obtiene información básica de la imagen"""
+        try:
+            with Image.open(image_path) as img:
+                size = os.path.getsize(image_path)
+                return {
+                    'width': img.width,
+                    'height': img.height,
+                    'size': size,
+                    'format': img.format
+                }
+        except Exception:
+            return None
+    
+    def remove_background(self, input_path, output_path):
+        """Elimina el fondo de una imagen"""
+        try:
+            with open(input_path, 'rb') as inp:
+                background_output = remove(inp.read())
+                with open(output_path, 'wb') as outp:
+                    outp.write(background_output)
+            return True
+        except Exception as e:
+            print(f"Error eliminando fondo: {str(e)}")
+            return False
+    
+    def resize_image(self, input_path, output_path, width, height):
+        """Redimensiona una imagen"""
+        try:
+            with Image.open(input_path) as img:
+                # Convertir a RGBA si no lo es para manejar transparencia
+                if img.mode != 'RGBA':
+                    img = img.convert('RGBA')
+                
+                # Crear nueva imagen con las dimensiones especificadas
+                new_img = Image.new('RGBA', (int(width), int(height)), (0, 0, 0, 0))
+                
+                # Redimensionar manteniendo proporción
+                img.thumbnail((int(width), int(height)), Image.Resampling.LANCZOS)
+                
+                # Centrar la imagen
+                x = (int(width) - img.width) // 2
+                y = (int(height) - img.height) // 2
+                new_img.paste(img, (x, y), img)
+                
+                new_img.save(output_path, 'PNG', optimize=True)
+            return True
+        except Exception as e:
+            print(f"Error redimensionando: {str(e)}")
+            return False
+    
+    def optimize_image_weight(self, image_path):
+        """Optimiza el peso de la imagen usando oxipng"""
+        try:
+            # Primero optimizar con PIL
+            with Image.open(image_path) as img:
+                if img.mode != 'RGBA':
+                    img = img.convert('RGBA')
+                img.save(image_path, 'PNG', optimize=True, compress_level=6)
+            
+            # Luego con oxipng para mayor compresión
+            optimize(image_path, level=3)
+            return True
+        except Exception as e:
+            print(f"Error optimizando peso: {str(e)}")
+            return False
+    
+    def process_single_image(self, image_path, session_id, settings):
+        """Procesa una sola imagen según la configuración"""
+        filename = os.path.basename(image_path)
+        name_without_ext = os.path.splitext(filename)[0]
+        
+        # Información original
+        original_info = self.get_image_info(image_path)
+        if not original_info:
+            return None
+        
+        # Rutas temporales y de salida
+        temp_path = os.path.join(tempfile.gettempdir(), f"temp_{session_id}_{filename}")
+        output_path = os.path.join(OUTPUT_FOLDER, session_id, f"{name_without_ext}_processed.png")
+        
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # Copiar imagen original para procesamiento
+        shutil.copy2(image_path, temp_path)
+        current_path = temp_path
+        
+        try:
+            # Procesar según switches activados
+            if settings.get('remove_background', False):
+                bg_removed_path = os.path.join(tempfile.gettempdir(), f"nobg_{session_id}_{filename}")
+                if self.remove_background(current_path, bg_removed_path):
+                    if current_path != temp_path:
+                        os.remove(current_path)
+                    current_path = bg_removed_path
+                else:
+                    raise Exception("Error eliminando fondo")
+            
+            if settings.get('resize', False):
+                width = settings.get('width', 600)
+                height = settings.get('height', 600)
+                resized_path = os.path.join(tempfile.gettempdir(), f"resized_{session_id}_{filename}")
+                
+                if self.resize_image(current_path, resized_path, width, height):
+                    if current_path != temp_path:
+                        os.remove(current_path)
+                    current_path = resized_path
+                else:
+                    raise Exception("Error redimensionando")
+            
+            # Mover resultado final y optimizar
+            shutil.move(current_path, output_path)
+            self.optimize_image_weight(output_path)
+            
+            # Información final
+            final_info = self.get_image_info(output_path)
+            
+            # Calcular porcentaje de reducción
+            weight_reduction = 0
+            if original_info['size'] > 0:
+                weight_reduction = round(((original_info['size'] - final_info['size']) / original_info['size']) * 100)
+            
             return {
-                'success': False,
-                'filename': filename,
-                'error': f'Error general: {str(e)}'
-            }
-    
-    def _remove_background_from_image(self, image):
-        """Remueve el fondo de una imagen PIL usando rembg"""
-        # Convertir PIL a bytes
-        buffer = io.BytesIO()
-        # Guardar como PNG para preservar transparencia
-        image.save(buffer, format='PNG')
-        buffer.seek(0)
-        
-        # Usar rembg para remover fondo
-        result = remove(buffer.getvalue())
-        
-        # Convertir resultado de vuelta a PIL
-        return Image.open(io.BytesIO(result))
-    
-    def _resize_image(self, image, width, height):
-        """Redimensiona imagen con crop inteligente y preservación de transparencia"""
-        # Crear nuevo canvas transparente del tamaño objetivo
-        new_img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
-        
-        # Calcular la relación de aspecto
-        img_ratio = image.width / image.height
-        target_ratio = width / height
-        
-        if img_ratio > target_ratio:
-            # Imagen más ancha - ajustar por altura
-            new_height = height
-            new_width = int(height * img_ratio)
-        else:
-            # Imagen más alta - ajustar por ancho
-            new_width = width
-            new_height = int(width / img_ratio)
-        
-        # Redimensionar imagen manteniendo proporciones
-        resized = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-        
-        # Crop inteligente - centrar la imagen
-        if new_width > width:
-            # Crop horizontal
-            left = (new_width - width) // 2
-            resized = resized.crop((left, 0, left + width, new_height))
-        
-        if new_height > height:
-            # Crop vertical
-            top = (new_height - height) // 2
-            resized = resized.crop((0, top, new_width, top + height))
-        
-        # Centrar en el canvas final
-        x = (width - resized.width) // 2
-        y = (height - resized.height) // 2
-        new_img.paste(resized, (x, y), resized if resized.mode == 'RGBA' else None)
-        
-        return new_img
-    
-    def _optimize_image(self, image):
-        """Optimiza imagen para reducir peso manteniendo calidad"""
-        # Si la imagen es muy grande, reducir ligeramente la calidad para optimizar peso
-        buffer = io.BytesIO()
-        
-        # Configuraciones de optimización específicas para PNG
-        if image.mode == 'RGBA':
-            # Para imágenes con transparencia
-            image.save(buffer, format='PNG', optimize=True, compress_level=6)
-        else:
-            # Para imágenes sin transparencia, convertir a RGB puede ser más eficiente
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
-            image.save(buffer, format='PNG', optimize=True, compress_level=6)
-        
-        buffer.seek(0)
-        return Image.open(buffer)
-    
-    def process_multiple_images(self, images_data, remove_bg=False, resize=False, width=400, height=400):
-        """Procesa múltiples imágenes de forma paralela"""
-        results = []
-        
-        # Usar ThreadPoolExecutor para procesamiento paralelo
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            # Crear futures para cada imagen
-            futures = {
-                executor.submit(
-                    self.process_single_image,
-                    img_data['data'],
-                    img_data['filename'],
-                    remove_bg,
-                    resize,
-                    width,
-                    height
-                ): img_data for img_data in images_data
+                'filename': f"{name_without_ext}_processed.png",
+                'original_size': original_info['size'],
+                'final_size': final_info['size'],
+                'weight_reduction': weight_reduction,
+                'dimensions': f"{final_info['width']}x{final_info['height']}",
+                'path': output_path
             }
             
-            # Recopilar resultados conforme se completan
-            for future in as_completed(futures):
-                try:
-                    result = future.result(timeout=60)  # Timeout de 60 segundos por imagen
-                    results.append(result)
-                except Exception as e:
-                    img_data = futures[future]
-                    results.append({
-                        'success': False,
-                        'filename': img_data['filename'],
-                        'error': f'Timeout o error en procesamiento: {str(e)}'
-                    })
-        
-        return results
+        except Exception as e:
+            # Limpiar archivos temporales
+            for path in [temp_path, current_path]:
+                if os.path.exists(path):
+                    os.remove(path)
+            print(f"Error procesando {filename}: {str(e)}")
+            return None
 
 # Instancia del procesador
 processor = ImageProcessor()
 
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    """Endpoint para verificar que el servidor está funcionando"""
-    return jsonify({
-        'status': 'ok', 
-        'message': 'ImageProcessor Server is running',
-        'supported_formats': list(processor.supported_formats.keys())
-    })
-
-@app.route('/api/process-images', methods=['POST'])
-def process_images():
-    """Endpoint principal para procesar imágenes"""
+@app.route('/api/upload', methods=['POST'])
+def upload_files():
+    """Endpoint para subir archivos (imágenes o ZIP)"""
     try:
-        data = request.get_json()
+        if 'files' not in request.files:
+            return jsonify({'error': 'No se encontraron archivos'}), 400
         
-        if not data or 'images' not in data:
-            return jsonify({'error': 'No images provided'}), 400
+        files = request.files.getlist('files')
+        session_id = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        session_folder = os.path.join(UPLOAD_FOLDER, session_id)
+        os.makedirs(session_folder, exist_ok=True)
         
-        # Validar que hay imágenes
-        if len(data['images']) == 0:
-            return jsonify({'error': 'Empty images array'}), 400
+        uploaded_images = []
         
-        # Parámetros de procesamiento con valores por defecto
-        remove_bg = data.get('removeBackground', False)
-        resize = data.get('resize', False)
-        width = data.get('width', 400)
-        height = data.get('height', 400)
-        
-        # Validar dimensiones
-        try:
-            width = int(width)
-            height = int(height)
-            if width < 1 or height < 1 or width > 4000 or height > 4000:
-                return jsonify({'error': 'Dimensiones inválidas (1-4000px)'}), 400
-        except (ValueError, TypeError):
-            return jsonify({'error': 'Dimensiones deben ser números enteros'}), 400
-        
-        print(f"Procesando {len(data['images'])} imágenes:")
-        print(f"- Remover fondo: {remove_bg}")
-        print(f"- Redimensionar: {resize} ({width}x{height})")
-        
-        # Procesar imágenes (usando procesamiento paralelo para múltiples imágenes)
-        if len(data['images']) == 1:
-            # Procesamiento individual
-            img_data = data['images'][0]
-            result = processor.process_single_image(
-                img_data.get('data', ''),
-                img_data.get('filename', 'unknown.png'),
-                remove_bg, resize, width, height
-            )
-            processed_results = [result]
-        else:
-            # Procesamiento masivo paralelo
-            processed_results = processor.process_multiple_images(
-                data['images'], remove_bg, resize, width, height
-            )
-        
-        # Estadísticas del procesamiento
-        successful = len([r for r in processed_results if r.get('success', False)])
-        failed = len(processed_results) - successful
-        
-        response_data = {
-            'success': True,
-            'results': processed_results,
-            'stats': {
-                'total_processed': len(processed_results),
-                'successful': successful,
-                'failed': failed,
-                'success_rate': round((successful / len(processed_results)) * 100, 1) if processed_results else 0
-            }
-        }
-        
-        print(f"Procesamiento completado: {successful}/{len(processed_results)} exitosos")
-        return jsonify(response_data)
-        
-    except Exception as e:
-        print(f"Error en process_images: {str(e)}")
-        return jsonify({'error': f'Error interno del servidor: {str(e)}'}), 500
-
-@app.route('/api/download-zip', methods=['POST'])
-def download_zip():
-    """Endpoint para descargar todas las imágenes procesadas en un ZIP"""
-    try:
-        data = request.get_json()
-        
-        if not data or 'images' not in data:
-            return jsonify({'error': 'No images provided'}), 400
-        
-        # Filtrar solo imágenes exitosas
-        successful_images = [img for img in data['images'] if img.get('success', False)]
-        
-        if len(successful_images) == 0:
-            return jsonify({'error': 'No hay imágenes procesadas exitosamente'}), 400
-        
-        # Crear archivo ZIP temporal
-        zip_buffer = io.BytesIO()
-        
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zip_file:
-            for i, img_data in enumerate(successful_images):
-                try:
-                    # Obtener nombre de archivo y datos
-                    original_filename = img_data.get('filename', f'processed_image_{i}.png')
-                    filename = os.path.splitext(original_filename)[0] + '.png'  # Forzar extensión PNG
-                    
-                    image_base64 = img_data.get('processed_image', '')
-                    if image_base64.startswith('data:image'):
-                        image_base64 = image_base64.split(',')[1]
-                    
-                    # Decodificar y agregar al ZIP
-                    image_bytes = base64.b64decode(image_base64)
-                    zip_file.writestr(filename, image_bytes)
-                    
-                except Exception as e:
-                    print(f"Error agregando {original_filename} al ZIP: {str(e)}")
-                    continue
-        
-        zip_buffer.seek(0)
-        
-        # Crear nombre único para el archivo
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        zip_filename = f'processed_images_{timestamp}.zip'
-        
-        print(f"Enviando ZIP con {len(successful_images)} imágenes: {zip_filename}")
-        
-        return send_file(
-            io.BytesIO(zip_buffer.getvalue()),
-            as_attachment=True,
-            download_name=zip_filename,
-            mimetype='application/zip'
-        )
-        
-    except Exception as e:
-        print(f"Error en download_zip: {str(e)}")
-        return jsonify({'error': f'Error creando ZIP: {str(e)}'}), 500
-
-@app.route('/api/process-zip', methods=['POST'])
-def process_zip():
-    """Endpoint para procesar archivos ZIP cargados"""
-    try:
-        if 'file' not in request.files:
-            return jsonify({'error': 'No file provided'}), 400
-        
-        zip_file = request.files['file']
-        
-        if zip_file.filename == '' or not zip_file.filename.lower().endswith('.zip'):
-            return jsonify({'error': 'Invalid ZIP file'}), 400
-        
-        # Obtener parámetros de procesamiento
-        remove_bg = request.form.get('removeBackground', 'false').lower() == 'true'
-        resize = request.form.get('resize', 'false').lower() == 'true'
-        
-        try:
-            width = int(request.form.get('width', 400))
-            height = int(request.form.get('height', 400))
-        except ValueError:
-            return jsonify({'error': 'Invalid dimensions'}), 400
-        
-        extracted_images = []
-        
-        # Leer y extraer imágenes del ZIP
-        try:
-            with zipfile.ZipFile(zip_file, 'r') as zip_ref:
-                for filename in zip_ref.namelist():
-                    if not zip_ref.getinfo(filename).is_dir() and processor.is_supported_format(filename):
-                        try:
-                            # Leer imagen del ZIP
-                            image_data = zip_ref.read(filename)
-                            image_base64 = base64.b64encode(image_data).decode('utf-8')
-                            
-                            extracted_images.append({
-                                'filename': filename,
-                                'data': image_base64
-                            })
-                            
-                        except Exception as e:
-                            print(f"Error extrayendo {filename}: {str(e)}")
-                            continue
-        
-        except zipfile.BadZipFile:
-            return jsonify({'error': 'Archivo ZIP corrupto'}), 400
-        
-        if len(extracted_images) == 0:
-            return jsonify({'error': 'No se encontraron imágenes válidas en el ZIP'}), 400
-        
-        print(f"Extraídas {len(extracted_images)} imágenes del ZIP")
-        
-        # Procesar imágenes extraídas
-        processed_results = processor.process_multiple_images(
-            extracted_images, remove_bg, resize, width, height
-        )
-        
-        # Estadísticas
-        successful = len([r for r in processed_results if r.get('success', False)])
+        for file in files:
+            if file.filename == '':
+                continue
+                
+            filename = secure_filename(file.filename)
+            file_path = os.path.join(session_folder, filename)
+            file.save(file_path)
+            
+            # Verificar si es ZIP o imagen
+            if filename.lower().endswith('.zip'):
+                # Extraer imágenes del ZIP
+                extracted_images = processor.extract_images_from_zip(file_path, session_folder)
+                for img_path in extracted_images:
+                    img_info = processor.get_image_info(img_path)
+                    if img_info:
+                        uploaded_images.append({
+                            'filename': os.path.basename(img_path),
+                            'size': img_info['size'],
+                            'dimensions': f"{img_info['width']}x{img_info['height']}",
+                            'path': img_path
+                        })
+                # Eliminar ZIP después de extraer
+                os.remove(file_path)
+            else:
+                # Es una imagen individual
+                if processor.allowed_file(filename):
+                    img_info = processor.get_image_info(file_path)
+                    if img_info:
+                        uploaded_images.append({
+                            'filename': filename,
+                            'size': img_info['size'],
+                            'dimensions': f"{img_info['width']}x{img_info['height']}",
+                            'path': file_path
+                        })
         
         return jsonify({
-            'success': True,
-            'results': processed_results,
-            'stats': {
-                'total_extracted': len(extracted_images),
-                'total_processed': len(processed_results),
-                'successful': successful,
-                'failed': len(processed_results) - successful
-            }
+            'session_id': session_id,
+            'images': uploaded_images,
+            'total_images': len(uploaded_images)
         })
         
     except Exception as e:
-        print(f"Error en process_zip: {str(e)}")
-        return jsonify({'error': f'Error procesando ZIP: {str(e)}'}), 500
+        return jsonify({'error': f'Error subiendo archivos: {str(e)}'}), 500
 
-@app.errorhandler(413)
-def too_large(e):
-    return jsonify({'error': 'Archivo demasiado grande'}), 413
+@app.route('/api/process', methods=['POST'])
+def process_images():
+    """Endpoint para procesar imágenes"""
+    try:
+        data = request.get_json()
+        session_id = data.get('session_id')
+        settings = data.get('settings', {})
+        
+        if not session_id:
+            return jsonify({'error': 'session_id requerido'}), 400
+        
+        session_folder = os.path.join(UPLOAD_FOLDER, session_id)
+        if not os.path.exists(session_folder):
+            return jsonify({'error': 'Sesión no encontrada'}), 404
+        
+        # Obtener todas las imágenes de la sesión
+        image_files = []
+        for filename in os.listdir(session_folder):
+            file_path = os.path.join(session_folder, filename)
+            if os.path.isfile(file_path) and processor.allowed_file(filename):
+                image_files.append(file_path)
+        
+        if not image_files:
+            return jsonify({'error': 'No se encontraron imágenes para procesar'}), 400
+        
+        # Procesar imágenes en paralelo
+        processed_images = []
+        failed_images = []
+        
+        def process_wrapper(image_path):
+            try:
+                return processor.process_single_image(image_path, session_id, settings)
+            except Exception as e:
+                return None
+        
+        # Usar ThreadPoolExecutor para procesamiento paralelo
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_image = {executor.submit(process_wrapper, img_path): img_path 
+                             for img_path in image_files}
+            
+            for future in as_completed(future_to_image):
+                image_path = future_to_image[future]
+                try:
+                    result = future.result()
+                    if result:
+                        processed_images.append(result)
+                    else:
+                        failed_images.append(os.path.basename(image_path))
+                except Exception as e:
+                    failed_images.append(os.path.basename(image_path))
+                    print(f"Error procesando {image_path}: {str(e)}")
+        
+        return jsonify({
+            'session_id': session_id,
+            'processed_images': processed_images,
+            'failed_images': failed_images,
+            'total_processed': len(processed_images),
+            'total_failed': len(failed_images)
+        })
+        
+    except Exception as e:
+        return jsonify({'error': f'Error procesando imágenes: {str(e)}'}), 500
 
-@app.errorhandler(500)
-def internal_error(e):
-    return jsonify({'error': 'Error interno del servidor'}), 500
+@app.route('/api/download/<session_id>', methods=['GET'])
+def download_images(session_id):
+    """Endpoint para descargar imágenes procesadas"""
+    try:
+        output_folder = os.path.join(OUTPUT_FOLDER, session_id)
+        
+        if not os.path.exists(output_folder):
+            return jsonify({'error': 'No se encontraron imágenes procesadas'}), 404
+        
+        processed_files = [f for f in os.listdir(output_folder) 
+                          if f.endswith('.png')]
+        
+        if not processed_files:
+            return jsonify({'error': 'No hay imágenes procesadas para descargar'}), 404
+        
+        # Si es solo una imagen, descargar directamente
+        if len(processed_files) == 1:
+            return send_from_directory(output_folder, processed_files[0], as_attachment=True)
+        
+        # Si son múltiples imágenes, crear ZIP
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for filename in processed_files:
+                file_path = os.path.join(output_folder, filename)
+                zip_file.write(file_path, filename)
+        
+        zip_buffer.seek(0)
+        
+        return send_file(
+            zip_buffer,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=f'imagenes_procesadas_{session_id}.zip'
+        )
+        
+    except Exception as e:
+        return jsonify({'error': f'Error descargando: {str(e)}'}), 500
+
+@app.route('/api/preview/<session_id>/<filename>')
+def preview_image(session_id, filename):
+    """Endpoint para preview de imágenes"""
+    try:
+        # Buscar en carpeta de salida primero
+        output_folder = os.path.join(OUTPUT_FOLDER, session_id)
+        output_path = os.path.join(output_folder, filename)
+        
+        if os.path.exists(output_path):
+            return send_from_directory(output_folder, filename)
+        
+        # Buscar en carpeta de subida
+        upload_folder = os.path.join(UPLOAD_FOLDER, session_id)
+        upload_path = os.path.join(upload_folder, filename)
+        
+        if os.path.exists(upload_path):
+            return send_from_directory(upload_folder, filename)
+        
+        return jsonify({'error': 'Imagen no encontrada'}), 404
+        
+    except Exception as e:
+        return jsonify({'error': f'Error mostrando imagen: {str(e)}'}), 500
+
+@app.route('/api/cleanup/<session_id>', methods=['DELETE'])
+def cleanup_session(session_id):
+    """Endpoint para limpiar archivos de una sesión"""
+    try:
+        # Limpiar carpeta de subida
+        upload_folder = os.path.join(UPLOAD_FOLDER, session_id)
+        if os.path.exists(upload_folder):
+            shutil.rmtree(upload_folder)
+        
+        # Limpiar carpeta de salida
+        output_folder = os.path.join(OUTPUT_FOLDER, session_id)
+        if os.path.exists(output_folder):
+            shutil.rmtree(output_folder)
+        
+        return jsonify({'message': 'Sesión limpiada exitosamente'})
+        
+    except Exception as e:
+        return jsonify({'error': f'Error limpiando sesión: {str(e)}'}), 500
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Endpoint de verificación de salud del servidor"""
+    return jsonify({
+        'status': 'ok',
+        'message': 'Servidor funcionando correctamente',
+        'timestamp': datetime.now().isoformat()
+    })
 
 if __name__ == '__main__':
-    # Configurar límite de tamaño de archivo (100MB)
-    app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
-    
-    # Crear carpetas necesarias
-    os.makedirs('temp', exist_ok=True)
-    
-    print("=" * 50)
-    print(" IMAGEPROCESSOR SERVER")
-    print("=" * 50)
-    print(" Servidor iniciando...")
-    print(" Backend corriendo en: http://localhost:5000")
-    print(" Frontend esperado en: http://localhost:5173")
-    print(" CORS habilitado para desarrollo")
-    print(" Formatos soportados:", ", ".join(processor.supported_formats.keys()))
-    print(" Procesamiento paralelo habilitado")
-    print(" Soporte completo para archivos ZIP")
-    print("=" * 50)
-    
-    app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)
+    print("🚀 Iniciando servidor Image Processor...")
+    print("📡 Servidor disponible en: http://localhost:5000")
+    print("🔍 Health check: http://localhost:5000/api/health")
+    app.run(debug=True, host='0.0.0.0', port=5000)
